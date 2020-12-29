@@ -426,8 +426,9 @@ static vmword_t opop(struct vm *vm)
 /* push a value onto the op stack */
 static void opushf(struct vm *vm, vmsingle_t val)
 {
+	static_assert(sizeof(val) == sizeof(vmword_t), "vmword_t and vmsingle_t must be of equal size");
 	if (vm->op_stack < ARRAY_SIZE(vm->stack))
-		vm->stack[vm->op_stack++] = *(vmword_t*) & val;
+		memcpy(&vm->stack[vm->op_stack++], &val, sizeof(val));
 	else
 		vm_error_set(vm, VM_ERROR_STACK_OVERFLOW);
 }
