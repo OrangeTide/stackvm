@@ -1,6 +1,38 @@
 # Bug & design-limitation review of stackvm.c
 
-Priority: #1 (silent OOB write) and #3 (branch-target mismatch), since together they mean "any non-trivial guest can corrupt or mis-execute silently."
+## Priority (updated 2026-04-19, post-refactor)
+
+Tier 1 — host-safety breaks (guest can crash or corrupt the host process):
+  #1  dwrite1 OOB write after failed bounds check
+  #6  BLOCK_COPY / BREAK call abort()
+  #7  unchecked mallocs in vm_load
+  #J  vm_string derefs *len when len==NULL
+  #D  vm_enter / prepare_call no psp bounds check
+  #5  memset length wrong; wraps on malformed input → segfault
+
+Tier 2 — correctness / VM mis-executes:
+  #2  vm_env_call uses wrong local_size on leave (likely root of #11)
+  #11 ex3.qvm: saved PC overwritten across re-entrant syscalls
+  #4  strict-aliasing UB in float push/pop (time bomb at -O2)
+  #9  LSH/RSHI/RSHU with shift count ≥ 32 (UB, host-divergent)
+  #10 signed-math UB (INT_MIN/-1, MULI overflow, NaN→int)
+
+Tier 3 — missing functionality:
+  #C  vm_run_slice doesn't actually slice — infinite guest loops hang host
+  #K  no BREAK callback / no guest stacktrace
+  #E  prepare_call doesn't validate nr_args against MAX_VMMAIN_ARGS
+
+Tier 4 — polish, portability, hygiene:
+  #8  fd leak on vm_load failure paths
+  #F  big-endian magic not supported
+  #G  DATA segment endianness assumption
+  #H  no syscall-table validation / default handler
+  #I  debug logging on hot path (megabytes of stderr per run)
+  small-stuff items
+
+#1 and #6 are the best starting points: both are one-line fixes, both eliminate
+a class of guest-triggered host crash. #2+#11 are the natural pair after that —
+fixing the re-entrant syscall frame likely unblocks the ex3 test.
 
 ## Real bugs (likely to fire)
 
