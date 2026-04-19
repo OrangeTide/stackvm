@@ -45,12 +45,6 @@ int stackvm_verbose = 0;
 #define PROGRAM_STACK_SIZE 0x10000
 #define MAX_VMMAIN_ARGS 13
 
-/* expanded instruction */
-struct vm_op {
-	int op;
-	int param;
-};
-
 struct vm;
 
 /* environment holds infomation common to multiple VMs */
@@ -63,10 +57,15 @@ struct vm {
 	const struct vm_env *env;
 	void *extra;
 	int yield; /* set if we run_slice should yield after system calls */
-	/* code is a read-only area for instructions */
-	struct vm_op *code;
+	/* code is a read-only raw byte stream of the CODE segment.
+	 * pc is a byte offset into this buffer. */
+	uint8_t *code;
 	size_t code_len;
-	size_t code_mask;
+	/* map instruction-index → byte offset within code.
+	 * Q3VM bytecode encodes branch/call targets as instruction ordinals,
+	 * not byte offsets, so every target that enters PC is translated here. */
+	uint32_t *instr_to_byte;
+	size_t nr_instructions;
 	/* heap is the RAM area for data */
 	union {
 		vmword_t *words;
@@ -279,61 +278,82 @@ static unsigned opcode_length(unsigned char op)
 	return len;
 }
 
-/* returns the count of instructions.
- * returns 0 on error or if there are no complete instructions. */
-static unsigned count_instructions(const unsigned char *opbytes, size_t oplen)
+static inline uint32_t read_imm4(const uint8_t *p)
 {
-	unsigned total = 0;
-
-	while (oplen > 0) {
-		// trace("opbytes=%p oplen=%zd total=%d\n", opbytes, oplen, total);
-		unsigned result = opcode_length(*opbytes);
-
-		if (result > oplen)
-			return 0; /* truncated instruction */
-
-		if (!result)
-			return 0; /* illegal instruction */
-
-		assert(result <= 5);
-		opbytes += result;
-		oplen -= result;
-		total++;
-	}
-
-	trace("total=%d\n", total);
-	return total;
+	return (uint32_t)p[0]
+	     | ((uint32_t)p[1] << 8)
+	     | ((uint32_t)p[2] << 16)
+	     | ((uint32_t)p[3] << 24);
 }
 
-static const char *disassemble_opcode(const struct vm_op *op)
+static inline uint8_t read_imm1(const uint8_t *p)
+{
+	return p[0];
+}
+
+/* translate a Q3VM instruction-index address to a byte offset in vm->code.
+ * sets VM_ERROR_OUT_OF_BOUNDS and returns 0 on an out-of-range index. */
+static vmword_t pc_from_addr(struct vm *vm, vmword_t addr)
+{
+	if (addr >= vm->nr_instructions) {
+		vm_error_set(vm, VM_ERROR_OUT_OF_BOUNDS);
+		return 0;
+	}
+	return vm->instr_to_byte[addr];
+}
+
+/* format a single opcode at byte offset `ofs` within `code`.
+ * if the opcode is illegal or truncated, returns a best-effort string. */
+static const char *disassemble_opcode(const uint8_t *code, size_t ofs, size_t code_len)
 {
 	static char buf[256];
-	unsigned b = op->op;
+	unsigned b = code[ofs];
+	unsigned len = opcode_length(b);
 
-	if (b < ARRAY_SIZE(opcode_to_name)) {
-		if (opcode_length(b) > 1) {
-			unsigned p = op->param;
-			snprintf(buf, sizeof(buf), "%s %d [0x%02x %#x]",
-			         opcode_to_name[b], p, b, p);
-		} else {
-			snprintf(buf, sizeof(buf), "%s [0x%02x]",
-			         opcode_to_name[b], b);
-		}
+	if (len == 0 || b >= ARRAY_SIZE(opcode_to_name)) {
+		snprintf(buf, sizeof(buf), "0x%02x (bad)", b & 255);
+		return buf;
+	}
+
+	if (len > code_len - ofs) {
+		snprintf(buf, sizeof(buf), "%s [0x%02x] (truncated)",
+		         opcode_to_name[b], b);
+		return buf;
+	}
+
+	if (len == 1) {
+		snprintf(buf, sizeof(buf), "%s [0x%02x]",
+		         opcode_to_name[b], b);
+	} else if (len == 2) {
+		unsigned p = read_imm1(code + ofs + 1);
+		snprintf(buf, sizeof(buf), "%s %d [0x%02x %#x]",
+		         opcode_to_name[b], p, b, p);
+	} else if (len == 5) {
+		uint32_t p = read_imm4(code + ofs + 1);
+		snprintf(buf, sizeof(buf), "%s %d [0x%02x %#x]",
+		         opcode_to_name[b], (int)p, b, p);
 	} else {
-		snprintf(buf, sizeof(buf), "0x%02hhx", b & 255);
+		snprintf(buf, sizeof(buf), "%s [0x%02x] (bad len=%u)",
+		         opcode_to_name[b], b, len);
 	}
 
 	return buf;
 }
 
-static void disassemble(FILE *out, const struct vm_op *ops, size_t ops_len, vmword_t baseaddr)
+static void disassemble(FILE *out, const uint8_t *code, size_t code_len, vmword_t baseaddr)
 {
-	unsigned i;
-	fprintf(out, "---8<--- start of disassembly (len=%zd) ---8<---\n", ops_len);
+	fprintf(out, "---8<--- start of disassembly (bytes=%zd) ---8<---\n", code_len);
 
-	for (i = 0; i < ops_len; i++)
+	size_t p = 0;
+	while (p < code_len) {
+		unsigned len = opcode_length(code[p]);
 		fprintf(out, "%06x: %s\n",
-		        baseaddr + i, disassemble_opcode(ops + i));
+		        baseaddr + (unsigned)p,
+		        disassemble_opcode(code, p, code_len));
+		if (len == 0 || len > code_len - p)
+			break; /* cannot safely advance */
+		p += len;
+	}
 
 	fprintf(out, "---8<--- end of disassembly ---8<---\n");
 }
@@ -351,7 +371,7 @@ static size_t make_mask(size_t len)
 
 static inline int _check_code_bounds(const char *func, unsigned line, struct vm *vm, vmword_t ofs)
 {
-	if (ofs & ~vm->code_mask) {
+	if (ofs >= vm->code_len) {
 		error("%s():%d:ofs=%d (%#x)\n", func, line, ofs, ofs);
 		vm_error_set(vm, VM_ERROR_OUT_OF_BOUNDS);
 		return -1;
@@ -361,7 +381,7 @@ static inline int _check_code_bounds(const char *func, unsigned line, struct vm 
 }
 
 #define check_code_bounds(vm, ofs) do { \
-	if (ofs & ~vm->code_mask) { \
+	if ((ofs) >= (vm)->code_len) { \
 		vm_error_set(vm, VM_ERROR_OUT_OF_BOUNDS); \
 	} } while (0)
 
@@ -554,6 +574,32 @@ void vm_disassemble(const struct vm *vm)
 	disassemble(stdout, vm->code, vm->code_len, 0);
 }
 
+/* decode opcode + optional immediate at vm->pc, advancing vm->pc past them.
+ * returns 1 on success, 0 on end-of-code, -1 on illegal/truncated opcode. */
+static int fetch_op(struct vm *vm, uint8_t *out_op, vmword_t *out_param)
+{
+	if (vm->pc >= vm->code_len)
+		return 0;
+
+	uint8_t op = vm->code[vm->pc];
+	unsigned len = opcode_length(op);
+
+	if (len == 0 || len > vm->code_len - vm->pc)
+		return -1;
+
+	vmword_t param = 0;
+
+	if (len == 2)
+		param = read_imm1(&vm->code[vm->pc + 1]);
+	else if (len == 5)
+		param = read_imm4(&vm->code[vm->pc + 1]);
+
+	vm->pc += len;
+	*out_op = op;
+	*out_param = param;
+	return 1;
+}
+
 #if 0
 static void vm_stacktrace(const struct vm *vm)
 {
@@ -570,16 +616,30 @@ int vm_run_slice(struct vm *vm)
 	vmsingle_t bf; /* scratch area */
 	int e;
 
-	debug("code_mask=0x%08zx code_len=0x%08zx\n",
-	      vm->code_mask, vm->code_len);
+	debug("code_len=0x%08zx\n", vm->code_len);
 	debug("heap_mask=0x%08zx heap_len=0x%08zx\n",
 	      vm->heap_mask, vm->heap_len);
-	/* the interpreter should only use _mask, not _len for checks */
-	assert(vm->code_mask == make_mask(vm->code_len));
 	assert(vm->heap_mask == make_mask(vm->heap_len));
 
 	while (!vm->status && !_check_code_bounds(__func__, __LINE__, vm, vm->pc)) {
-		struct vm_op *op = &vm->code[vm->pc++];
+		if (vm->pc >= vm->code_len) {
+			vm_error_set(vm, VM_ERROR_OUT_OF_BOUNDS);
+			break;
+		}
+
+		vmword_t op_pc = vm->pc;
+		uint8_t op_byte;
+		vmword_t param;
+		int f = fetch_op(vm, &op_byte, &param);
+
+		if (f == 0) {
+			vm_error_set(vm, VM_ERROR_OUT_OF_BOUNDS);
+			break;
+		}
+		if (f < 0) {
+			vm_error_set(vm, VM_ERROR_INVALID_OPCODE);
+			break;
+		}
 
 #ifdef DEBUG_ENABLED
 		{ /* debug only */
@@ -589,12 +649,13 @@ int vm_run_slice(struct vm *vm)
 				top = vm->stack[vm->op_stack - 1];
 
 			debug("PC:pc=%d (%#x) op=%s top=%d (%#x) psp=%d (%#x)\n",
-			      vm->pc - 1, vm->pc - 1, disassemble_opcode(op),
+			      op_pc, op_pc,
+			      disassemble_opcode(vm->code, op_pc, vm->code_len),
 			      top, top, vm->psp, vm->psp);
 		}
 #endif
 
-		switch (op->op) {
+		switch (op_byte) {
 			;
 		case 0x00: /* UNDEF*/
 			break;
@@ -604,10 +665,10 @@ int vm_run_slice(struct vm *vm)
 			abort(); // TODO: implement a debugging callback
 			break;
 		case 0x03: /* ENTER - increase program stack by amount */
-			vm->psp -= op->param;
+			vm->psp -= param;
 			break;
 		case 0x04: /* LEAVE - shrink program stack by amount */
-			if (vm_leave(vm, op->param)) {
+			if (vm_leave(vm, param)) {
 				e = 1; /* finished - results on stack */
 				goto out;
 			}
@@ -641,8 +702,7 @@ int vm_run_slice(struct vm *vm)
 					vm->vm_filename, vm->pc, old_pc);
 				vm->pc = old_pc;
 			} else {
-				vm->pc = a;
-				check_code_bounds(vm, vm->pc);
+				vm->pc = pc_from_addr(vm, a);
 			}
 
 			break;
@@ -653,22 +713,21 @@ int vm_run_slice(struct vm *vm)
 			opop(vm);
 			break;
 		case 0x08: /* CONST x */
-			opush(vm, op->param);
+			opush(vm, param);
 			break;
 		case 0x09: /* LOCAL x - get address of local */
-			a = vm->psp + op->param;
+			a = vm->psp + param;
 			opush(vm, a);
 			break;
 		case 0x0a: /* JUMP */
-			vm->pc = opop(vm);
-			check_code_bounds(vm, vm->pc);
+			vm->pc = pc_from_addr(vm, opop(vm));
 			break;
 		case 0x0b: /* EQ x */
 			a = opop(vm);
 			b = opop(vm);
 
 			if (b == a)
-				vm->pc = op->param;
+				vm->pc = pc_from_addr(vm, param);
 
 			break;
 		case 0x0c: /* NE x */
@@ -676,7 +735,7 @@ int vm_run_slice(struct vm *vm)
 			b = opop(vm);
 
 			if (b != a)
-				vm->pc = op->param;
+				vm->pc = pc_from_addr(vm, param);
 
 			break;
 		case 0x0d: /* LTI x */
@@ -684,7 +743,7 @@ int vm_run_slice(struct vm *vm)
 			b = opop(vm);
 
 			if ((int)b < (int)a)
-				vm->pc = op->param;
+				vm->pc = pc_from_addr(vm, param);
 
 			break;
 		case 0x0e: /* LEI x */
@@ -692,7 +751,7 @@ int vm_run_slice(struct vm *vm)
 			b = opop(vm);
 
 			if ((int)b <= (int)a)
-				vm->pc = op->param;
+				vm->pc = pc_from_addr(vm, param);
 
 			break;
 		case 0x0f: /* GTI x */
@@ -700,7 +759,7 @@ int vm_run_slice(struct vm *vm)
 			b = opop(vm);
 
 			if ((int)b > (int)a)
-				vm->pc = op->param;
+				vm->pc = pc_from_addr(vm, param);
 
 			break;
 		case 0x10: /* GEI x */
@@ -708,7 +767,7 @@ int vm_run_slice(struct vm *vm)
 			b = opop(vm);
 
 			if ((int)b >= (int)a)
-				vm->pc = op->param;
+				vm->pc = pc_from_addr(vm, param);
 
 			break;
 		case 0x11: /* LTU x */
@@ -716,7 +775,7 @@ int vm_run_slice(struct vm *vm)
 			b = opop(vm);
 
 			if (b < a)
-				vm->pc = op->param;
+				vm->pc = pc_from_addr(vm, param);
 
 			break;
 		case 0x12: /* LEU x */
@@ -724,7 +783,7 @@ int vm_run_slice(struct vm *vm)
 			b = opop(vm);
 
 			if (b <= a)
-				vm->pc = op->param;
+				vm->pc = pc_from_addr(vm, param);
 
 			break;
 		case 0x13: /* GTU x */
@@ -732,7 +791,7 @@ int vm_run_slice(struct vm *vm)
 			b = opop(vm);
 
 			if (b > a)
-				vm->pc = op->param;
+				vm->pc = pc_from_addr(vm, param);
 
 			break;
 		case 0x14: /* GEU x */
@@ -740,7 +799,7 @@ int vm_run_slice(struct vm *vm)
 			b = opop(vm);
 
 			if (b >= a)
-				vm->pc = op->param;
+				vm->pc = pc_from_addr(vm, param);
 
 			break;
 		case 0x15: /* EQF x */
@@ -748,7 +807,7 @@ int vm_run_slice(struct vm *vm)
 			bf = opopf(vm);
 
 			if (bf == af)
-				vm->pc = op->param;
+				vm->pc = pc_from_addr(vm, param);
 
 			break;
 		case 0x16: /* NEF x */
@@ -756,7 +815,7 @@ int vm_run_slice(struct vm *vm)
 			bf = opopf(vm);
 
 			if (bf != af)
-				vm->pc = op->param;
+				vm->pc = pc_from_addr(vm, param);
 
 			break;
 		case 0x17: /* LTF x */
@@ -764,7 +823,7 @@ int vm_run_slice(struct vm *vm)
 			bf = opopf(vm);
 
 			if (bf < af)
-				vm->pc = op->param;
+				vm->pc = pc_from_addr(vm, param);
 
 			break;
 		case 0x18: /* LEF x */
@@ -772,7 +831,7 @@ int vm_run_slice(struct vm *vm)
 			bf = opopf(vm);
 
 			if (bf <= af)
-				vm->pc = op->param;
+				vm->pc = pc_from_addr(vm, param);
 
 			break;
 		case 0x19: /* GTF x */
@@ -780,7 +839,7 @@ int vm_run_slice(struct vm *vm)
 			bf = opopf(vm);
 
 			if (bf > af)
-				vm->pc = op->param;
+				vm->pc = pc_from_addr(vm, param);
 
 			break;
 		case 0x1a: /* GEF x */
@@ -788,7 +847,7 @@ int vm_run_slice(struct vm *vm)
 			bf = opopf(vm);
 
 			if (bf >= af)
-				vm->pc = op->param;
+				vm->pc = pc_from_addr(vm, param);
 
 			break;
 		case 0x1b: /* LOAD1 */
@@ -825,15 +884,15 @@ int vm_run_slice(struct vm *vm)
 			break;
 		case 0x21: /* ARG x - write value to program stack */
 			a = opop(vm);
-			b = vm->psp + op->param;
-			trace("%s:ARG %d (@%d) : %d\n", vm->vm_filename, op->param, b, a);
+			b = vm->psp + param;
+			trace("%s:ARG %d (@%d) : %d\n", vm->vm_filename, param, b, a);
 			dwrite4(vm, b, a);
 			break;
 		case 0x22: /* BLOCK_COPY x - copy x bytes */
 			a = opop(vm); /* src */
 			b = opop(vm); /* dest */
 #if 0 // TODO: implement this
-			block_copy(vm, b, a, op->param);
+			block_copy(vm, b, a, param);
 #endif
 			abort(); // TODO: implement this
 			break;
@@ -1016,7 +1075,7 @@ static void prepare_call(struct vm *vm, vmword_t entry, unsigned nr_args)
 {
 	assert(vm != NULL);
 	// TODO: turn this into a syscall if entry address is negative
-	vm->pc = entry;
+	vm->pc = pc_from_addr(vm, entry);
 	/* make space for args and return */
 	vmword_t old_psp = vm->psp - 8;
 	vm->psp -= 8 + (4 * nr_args);
@@ -1121,7 +1180,10 @@ void vm_free(struct vm *vm)
 	vm->heap_len = vm->heap_mask = 0;
 	free(vm->code);
 	vm->code = NULL;
-	vm->code_len = vm->code_mask = 0;
+	vm->code_len = 0;
+	free(vm->instr_to_byte);
+	vm->instr_to_byte = NULL;
+	vm->nr_instructions = 0;
 	free(vm);
 }
 
@@ -1197,9 +1259,15 @@ int vm_load(struct vm *vm, const char *filename)
 	if (e)
 		goto failure_freevm;
 
-	/* load code segment */
+	/* load code segment: keep the raw byte stream; pc is a byte offset. */
 	size_t codebuf_len = header.code_length;
 	unsigned char *codebuf = malloc(codebuf_len);
+
+	if (!codebuf) {
+		error("out of memory allocating code buffer (%zd bytes)\n",
+		      codebuf_len);
+		goto failure_freevm;
+	}
 
 	if (fseek(f, header.code_offset, SEEK_SET))
 		goto failure_perror;
@@ -1207,60 +1275,48 @@ int vm_load(struct vm *vm, const char *filename)
 	if (fread(codebuf, 1, codebuf_len, f) != codebuf_len)
 		goto failure_perror; // TODO: check errno and print short msg
 
-	/* expand code segment into ops */
+	/* validate opcode stream end-to-end and build instruction-index table.
+	 * Q3VM encodes call/branch targets as ordinals, so we need the map
+	 * to translate them to byte offsets at dispatch time. */
 	trace("codebuf=%p codebuf_len=%zd\n", codebuf, codebuf_len);
-	unsigned instruction_count = count_instructions(codebuf, codebuf_len);
-	size_t code_size = roundup_pow2(instruction_count);
-	trace("instruction_count=%d code_size=%zd\n", instruction_count, code_size);
-	vm->code = malloc(code_size * sizeof(*vm->code));
-	unsigned i;
-	unsigned n = 0;
-
-	for (i = 0; i < instruction_count; i++) {
-		if (n >= codebuf_len) {
-			error("incorrect instruction count at %d (i=%d cnt=%d)\n", n, i, instruction_count);
+	uint32_t *instr_to_byte = NULL;
+	size_t nr_instructions = 0;
+	{
+		/* worst case one instruction per byte */
+		instr_to_byte = malloc(sizeof(*instr_to_byte) * (codebuf_len + 1));
+		if (!instr_to_byte) {
+			error("out of memory allocating instruction table\n");
 			goto failure_freecodebuf;
 		}
+		size_t n = 0;
+		while (n < codebuf_len) {
+			unsigned oplen = opcode_length(codebuf[n]);
 
-		unsigned oplen = opcode_length(codebuf[n]);
+			if (oplen == 0) {
+				error("invalid opcode 0x%02x at offset %zd!\n",
+				      codebuf[n], n);
+				free(instr_to_byte);
+				goto failure_freecodebuf;
+			}
 
-		if (oplen > codebuf_len - n) {
-			error("trucated opcode sequence at offset %d!\n", n);
-			goto failure_freecodebuf;
+			if (oplen > codebuf_len - n) {
+				error("truncated opcode sequence at offset %zd!\n", n);
+				free(instr_to_byte);
+				goto failure_freecodebuf;
+			}
+
+			instr_to_byte[nr_instructions++] = (uint32_t)n;
+			n += oplen;
 		}
-
-		if (oplen == 0) {
-			error("invalid opcode at offset %d!\n", n);
-			goto failure_freecodebuf;
-		} else if (oplen == 1) {
-			vm->code[i].param = 0;
-		} else if (oplen == 2) { /* 8-bit parameter */
-			vm->code[i].param = codebuf[n + 1];
-		} else if (oplen == 5) { /* 32-bit parameter */
-			vm->code[i].param =
-			        codebuf[n + 1] |
-			        ((vmword_t)codebuf[n + 2] << 8) |
-			        ((vmword_t)codebuf[n + 3] << 16) |
-			        ((vmword_t)codebuf[n + 4] << 24);
-		} else {
-			error("opcode size %d is not supported!\n", oplen);
-			goto failure_freecodebuf;
-		}
-
-		// trace("i=%d n=%d oplen=%d\n", i, n, oplen);
-		vm->code[i].op = codebuf[n];
-		n += oplen;
 	}
 
-	for (; i < code_size; i++) {
-		vm->code[i].op = 0x02; /* BREAK */
-		vm->code[i].param = 0;
-	}
-
-	vm->code_len = instruction_count;
-	vm->code_mask = make_mask(code_size);
-	free(codebuf);
-	debug("Loaded %d opcodes\n", instruction_count);
+	vm->code = codebuf;
+	vm->code_len = codebuf_len;
+	vm->instr_to_byte = instr_to_byte;
+	vm->nr_instructions = nr_instructions;
+	debug("%zu instructions in %zd code bytes\n",
+	      nr_instructions, codebuf_len);
+	debug("Loaded %zd code bytes\n", codebuf_len);
 
 	fclose(f);
 
