@@ -25,12 +25,14 @@ int stackvm_verbose = 0;
 #define error(format, ...) fprintf(stderr, "ERROR:%s():%d:" format, __func__, __LINE__, ## __VA_ARGS__)
 #define warn(format, ...) fprintf(stderr, "WARN:" format, ## __VA_ARGS__)
 #define info(format, ...) do { if (stackvm_verbose > 0) fprintf(stderr, "INFO:" format, ## __VA_ARGS__); } while(0)
-#ifdef DEBUG_ENABLED
+/* hot-path logging is disabled by default (megabytes of output otherwise).
+ * build with -DVM_VERBOSE to re-enable debug/trace from the dispatch loop. */
+#ifdef VM_VERBOSE
 #define debug(format, ...) fprintf(stderr, "DEBUG:%s():%d:" format, __func__, __LINE__, ## __VA_ARGS__)
 #define trace(format, ...) fprintf(stderr, "TRACE:%s():%d:" format, __func__, __LINE__, ## __VA_ARGS__)
 #else
-#define debug(format, ...) /* disabled debug messages */
-#define trace(format, ...) /* disabled trace messages */
+#define debug(format, ...) ((void)0)
+#define trace(format, ...) ((void)0)
 #endif
 
 #define vm_error_set(vm, flag) do { \
@@ -53,6 +55,7 @@ struct vm_env {
 	unsigned nr_syscalls;
 	void (**syscalls)(struct vm *vm);
 	int (*break_handler)(struct vm *vm); /* nonzero return = resume, 0 = abort */
+	void (*default_syscall)(struct vm *vm, int syscall_num);
 };
 
 struct vm {
@@ -103,21 +106,29 @@ static char *opcode_to_name[] = {
 	"RSHU", "NEGF", "ADDF", "SUBF",
 	"DIVF", "MULF", "CVIF", "CVFI",
 };
+/* opcode range is UNDEF(0x00)..CVFI(0x3B), i.e. 60 entries */
+_Static_assert(sizeof(opcode_to_name)/sizeof(opcode_to_name[0]) == 60,
+	"opcode_to_name[] must track the opcode enum (0x00..0x3B)");
 
 struct vm_env *vm_env_new(unsigned nr_syscalls)
 {
-
 	struct vm_env *env = calloc(1, sizeof(*env));
-	assert(env != NULL);
+	if (!env)
+		return NULL;
 	env->nr_syscalls = nr_syscalls;
 	env->syscalls = calloc(sizeof(*env->syscalls), nr_syscalls);
-	assert(env->syscalls != NULL);
+	if (!env->syscalls) {
+		free(env);
+		return NULL;
+	}
 	return env;
 }
 
 int vm_env_register(struct vm_env *env, int syscall_num, void (*sc)(struct vm *vm))
 {
-	assert(syscall_num < 0);
+	/* clamp: INT_MIN would overflow -1 - syscall_num */
+	if (syscall_num >= 0 || syscall_num == INT_MIN)
+		return -1;
 	unsigned ofs = -1 - syscall_num;
 	if (ofs >= env->nr_syscalls)
 		return -1;
@@ -128,6 +139,11 @@ int vm_env_register(struct vm_env *env, int syscall_num, void (*sc)(struct vm *v
 void vm_env_set_break_handler(struct vm_env *env, int (*handler)(struct vm *vm))
 {
 	env->break_handler = handler;
+}
+
+void vm_env_set_default_syscall(struct vm_env *env, void (*handler)(struct vm *vm, int syscall_num))
+{
+	env->default_syscall = handler;
 }
 
 static inline vmword_t dread4(struct vm *vm, vmword_t ofs);
@@ -156,16 +172,27 @@ static void opush(struct vm *vm, vmword_t val);
 
 static int vm_env_call(const struct vm_env *env, int syscall_num, struct vm *vm)
 {
-	fprintf(stderr, "======== VM Call #%d : Start ========\n",
-		-1 - syscall_num);
+	info("======== VM Call #%d : Start ========\n", -1 - syscall_num);
 	debug("pc=%d (%#x) psp=%d (%#x)\n", vm->pc, vm->pc, vm->psp, vm->psp);
 	assert(syscall_num < 0);
 	unsigned ofs = -1 - syscall_num;
-	if (ofs >= env->nr_syscalls)
+	void (*sc)(struct vm *vm) = NULL;
+	if (ofs < env->nr_syscalls)
+		sc = env->syscalls[ofs];
+	if (!sc) {
+		if (env->default_syscall) {
+			unsigned old_stack = vm->op_stack;
+			env->default_syscall(vm, syscall_num);
+			if (vm->op_stack != old_stack + 1 && !vm->status) {
+				error("%s:default syscall handler %d did not push a return value\n",
+				      vm->vm_filename, syscall_num);
+				vm_error_set(vm, VM_ERROR_BAD_SYSCALL);
+				return -1;
+			}
+			return 0;
+		}
 		goto out_error;
-	void (*sc)(struct vm *vm) = env->syscalls[ofs];
-	if (!sc) // TODO: catch this as an error
-		goto out_error;
+	}
 	/* syscalls don't use the VM frame convention: no ENTER/LEAVE.
 	 * caller (CALL dispatch) saves/restores vm->pc around this. */
 	unsigned old_stack = vm->op_stack;
@@ -179,11 +206,11 @@ static int vm_env_call(const struct vm_env *env, int syscall_num, struct vm *vm)
 		opush(vm, 0);
 		// TODO: set an error flag instead of trying to fix it.
 	}
-	fprintf(stderr, "======== VM Call #%d : Success ========\n", ofs);
+	info("======== VM Call #%d : Success ========\n", ofs);
 	debug("pc=%d (%#x) psp=%d (%#x)\n", vm->pc, vm->pc, vm->psp, vm->psp);
 	return 0;
 out_error:
-	fprintf(stderr, "======== VM Call #%d : Error ========\n", ofs);
+	info("======== VM Call #%d : Error ========\n", ofs);
 	debug("pc=%d (%#x) psp=%d (%#x)\n", vm->pc, vm->pc, vm->psp, vm->psp);
 	return -1;
 }
@@ -651,7 +678,6 @@ int vm_run_slice(struct vm *vm, unsigned max_steps)
 			goto out;
 		}
 
-		vmword_t op_pc = vm->pc;
 		uint8_t op_byte;
 		vmword_t param;
 		int f = fetch_op(vm, &op_byte, &param);
@@ -665,8 +691,9 @@ int vm_run_slice(struct vm *vm, unsigned max_steps)
 			break;
 		}
 
-#ifdef DEBUG_ENABLED
+#ifdef VM_VERBOSE
 		{ /* debug only */
+			vmword_t op_pc = vm->pc - opcode_length(op_byte);
 			vmword_t top = ~0;
 
 			if (vm->op_stack)
@@ -1225,6 +1252,10 @@ static int load_data_segment(struct vm *vm, FILE *f, const char *filename, const
 	if (fseek(f, data_offset, SEEK_SET))
 		goto failure_perror;
 
+	/* NOTE: the DATA segment is copied verbatim. q3asm emits little-endian
+	 * words, so subsequent word accesses via heap.words[] assume a
+	 * little-endian host. On a big-endian host this segment would need
+	 * per-word byte-swapping; currently we don't support that. */
 	if (fread(vm->heap.bytes, 1, data_length, f) != (size_t)data_length)
 		goto failure_perror; // TODO: check errno and print short read msg
 
@@ -1292,6 +1323,11 @@ int vm_load(struct vm *vm, const char *filename)
 		header_version = 2;
 	} else if (header_len >= 32 && header.magic == VM_MAGIC) {
 		header_version = 1;
+	} else if (header_len >= 32 && (header.magic == __builtin_bswap32(VM_MAGIC) ||
+	                                 header.magic == __builtin_bswap32(VM_MAGIC_VER2))) {
+		error("%s:byte-swapped VM file (magic=0x%08" PRIx32 "); big-endian .qvm files are not supported\n",
+		      filename, header.magic);
+		goto failure;
 	} else {
 		error("%s:not a valid VM file (magic=0x%08" PRIx32 " len=%zd)\n",
 		      filename, header.magic, header_len);

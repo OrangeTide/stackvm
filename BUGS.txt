@@ -1,42 +1,22 @@
 # Bug & design-limitation review of stackvm.c
 
-## Priority (updated 2026-04-19, post-refactor)
-
-Tier 4 — polish, portability, hygiene:
-  #F  big-endian magic not supported
-  #G  DATA segment endianness assumption
-  #H  no syscall-table validation / default handler
-  #I  debug logging on hot path (megabytes of stderr per run)
-  small-stuff items
+All previously-tracked correctness, missing-functionality, and Tier-4
+polish bugs have been addressed. Remaining items below are design
+limitations whose resolutions would be substantial refactors, not bug
+fixes.
 
 ## Design-level limitations
 
 - [ ] A. No code-byte→instruction mapping kept. Same root as bug #3, but separately: syscalls and disassembly
   can't report a byte PC that q3asm's debug info would refer to. Keep both code[] and an ip_of[] map.
+  (Partial: PC is now byte-addressed post-refactor, so syscalls and traces DO report native byte PCs. A
+  dedicated ip_of[] is still absent but may no longer be necessary.)
 
 - [ ] B. code_mask/heap_mask forces power-of-two sizes. Real code size is padded with BREAK (stackvm.c:1237) —
   a PC that walks off real code lands on a BREAK-pad and abort()s instead of erroring cleanly. Replace mask
    checks with pc < code_len comparisons; drop the pad + abort.
+  (Partial: code[] no longer uses a mask post-refactor; heap still does.)
 
-- [ ] F. No big-endian magic support. stackvm.txt documents 0x12721444 or 0x44147212; loader accepts only the
-  native-endian form. Either swap on load or reject with a clear message.
+## Small stuff (remaining)
 
-- [ ] G. Float/integer endianness of DATA segment. heap.words[ofs>>2] = val assumes host word endianness
-  matches file word endianness — fine on x86 with q3asm output today, but a portability trap worth
-  commenting.
-
-- [ ] H. vm_env syscall table is indexed by -1 - syscall_num and never validates the table on vm_new — a
-  missing handler in vm_env_call falls through to out_error, which is fine, but there's no way for a host
-  to enumerate or default-handle unknown syscalls.
-
-- [ ] I. Debug logging on hot path. Every opcode prints a debug(...) line to stderr (stackvm.c:579) and every
-  push/pop trace-logs. Even a trivial program generates megabytes of output. Guard with a compile-time or
-  runtime verbosity flag.
-
-## Small stuff
-
-- [ ] unsigned ofs = -1 - syscall_num; in vm_env_register/vm_env_call — if a host ever passes INT_MIN, -1 -INT_MIN overflows. Clamp.
-- [ ] assert() on allocation failure in vm_env_new — asserts are compiled out with -DNDEBUG; return NULL instead.
-- [ ] opcode_to_name array has 60 entries but is indexed with b < ARRAY_SIZE(...) — ok, but there's no compile-time check that it tracks the opcode enum.
-- [ ] vm_call never runs the VM despite the TODO; documentation in the header should say "call this then loop vm_run_slice."
 - [ ] Hardcoded VM_STACK_SIZE = 1024 op-stack words with no way to raise it per-vm.

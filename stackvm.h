@@ -1,5 +1,6 @@
 #ifndef STACKVM_H
 #define STACKVM_H
+#include <stddef.h> /* size_t */
 /* flags for vm.status
  * bit set means an error.
  */
@@ -26,9 +27,12 @@ struct vm;
 struct vm_env *vm_env_new(unsigned nr_syscalls);
 int vm_env_register(struct vm_env *env, int syscall_num, void (*sc)(struct vm *vm));
 void vm_env_set_break_handler(struct vm_env *env, int (*handler)(struct vm *vm));
+void vm_env_set_default_syscall(struct vm_env *env, void (*handler)(struct vm *vm, int syscall_num));
 void vm_stacktrace(const struct vm *vm);
 void vm_disassemble(const struct vm *vm);
 int vm_run_slice(struct vm *vm, unsigned max_steps);
+/* vm_call / vm_call_array only set up the call frame; the VM does not run
+ * until the host drives it with vm_run_slice() in a loop. */
 void vm_call(struct vm *vm, vmword_t entry, unsigned nr_args, ...);
 void vm_call_array(struct vm *vm, vmword_t entry, unsigned nr_args, const vmword_t args[]);
 void vm_free(struct vm *vm);
