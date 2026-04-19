@@ -23,7 +23,7 @@ tests :: demovm ex1.qvm ex2.qvm ex3.qvm
 	./demovm ex3.qvm
 
 ## use the q3vm tools:
-TOOLSDIR := ../../stackvm-tools
+TOOLSDIR := ../tools
 Q3ASM := $(TOOLSDIR)/q3asm
 Q3LCC := $(TOOLSDIR)/q3lcc
 

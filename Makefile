@@ -21,5 +21,7 @@ O.libstackvm := $(S.libstackvm:%.c=%.o)
 libstackvm.a : libstackvm.a($(O.libstackvm))
 all :: libstackvm.a
 clean :: ; $(RM) libstackvm.a $(O.libstackvm)
-tests ::
-	$(MAKE) -C tests tests
+tests :: libstackvm.a
+	$(MAKE) -C tests $@
+clean-all ::
+	$(MAKE) -C tests $@
