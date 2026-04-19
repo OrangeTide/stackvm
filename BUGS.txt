@@ -1,0 +1,114 @@
+# Bug & design-limitation review of stackvm.c
+
+Priority: #1 (silent OOB write) and #3 (branch-target mismatch), since together they mean "any non-trivial guest can corrupt or mis-execute silently."
+
+## Real bugs (likely to fire)
+
+- [ ] 1. dwrite1 still writes after an out-of-bounds check fails — stackvm.c:466
+  static inline void dwrite1(struct vm *vm, vmword_t ofs, uint8_t val)
+  {
+      check_data_bounds(vm, ofs);   // sets error flag, return ignored
+      vm->heap.bytes[ofs] = val;    // executes anyway → OOB write
+  }
+  Guest code can corrupt host memory with STORE1 to an out-of-range address. Return on failure like the
+  other dwrite*/dread*.
+
+- [ ] 2. vm_env_call uses the wrong local_size on leave — stackvm.c:175 (author already flagged // broken).
+  It also pre-overwrites vm->pc = 0xdeadbeef and then lets vm_leave read PC off the stack; only the
+  fallback vm->pc = old_pc after the call saves it. The whole enter/leave wrap around sc(vm) is dead work.
+  Simplest fix: drop the vm_enter/vm_leave pair for syscalls entirely — syscalls don't share the VM frame
+  convention.
+
+- [x] 3. Branch/CALL target address-space mismatch — FIXED (commit 0aa728a)
+  Original diagnosis was inverted: q3asm emits call/branch targets as *instruction ordinals*, and the old
+  expanded-op dispatcher happened to match that space by accident of indexing by instruction number. The
+  refactor moves dispatch to a raw byte stream (PC = byte offset) and adds an instr_to_byte[] table; CALL,
+  JUMP, conditional-branch immediates, and vm_call's entry arg translate through pc_from_addr().
+
+- [ ] 4. Strict-aliasing / type-punning in float push/pop — stackvm.c:421, 430
+  *(vmword_t*)&val and *(vmsingle_t*)(vm->stack + ...) are UB under -O2 with strict aliasing. Use memcpy or
+   a union — compilers have miscompiled exactly this pattern.
+
+- [ ] 5. memset length in load_data_segment — stackvm.c:1086
+  memset(vm->heap.bytes + data_length, 0x00, vm->heap_mask - data_length);
+  Should be vm->heap_len - data_length. heap_mask = heap_len - 1, so you're always zeroing one byte short
+  of the top of the heap. (Also: if data_length > heap_mask the subtraction wraps to a huge size_t →
+  segfault on malformed input.)
+
+- [ ] 6. BLOCK_COPY and BREAK call abort() — stackvm.c:591, 820
+  Guest code that hits either instantly kills the host process. At minimum set VM_ERROR_INVALID_OPCODE/a
+  new error bit instead.
+
+- [ ] 7. Unchecked mallocs in vm_load — codebuf, vm->code, and vm->heap.bytes are all used without NULL checks
+  (stackvm.c:1074, 1184, 1197). On OOM the process segfaults.
+
+- [ ] 8. File descriptor leaks on failure paths in vm_load — the
+  failure_perror/failure_freecodebuf/failure_freevm labels skip the fclose(f) that only failure: performs.
+
+- [ ] 9. Unshifted left/right shifts — stackvm.c:914, 919, 924
+  LSH/RSHI/RSHU use b << a without masking a & 31; shift counts ≥ 32 are UB in C and guest-visible on
+  different hosts.
+
+- [ ] 11. ex3.qvm: saved PC at psp+local_size gets overwritten across nested re-entrant calls
+  Reproduce: `make tests` — ex1 and ex2 pass, ex3 fails with VM_ERROR_OUT_OF_BOUNDS at pc=0x668a0
+  (=420000, the return value from trap_Callback(do_mul,600,700)). Dispatch trace ends on `LEAVE 24`
+  reading a bogus saved PC from address 131028; a prior `write 131028 : 420000` clobbered the slot.
+  Present on master before the byte-stream refactor too, so not a regression.
+  Suspects: (a) prepare_call / vm_env_call frame layout when the host re-enters the VM via
+  vm_call_array from inside a syscall handler — the inner call reuses psp that the outer guest frame
+  still owns; (b) the `// broken` vm_leave(vm, 0) in vm_env_call (see bug #2). Fix likely overlaps with
+  bug #2.
+
+  10. Signed math UB
+  - DIVI/MODI don't handle INT_MIN / -1 (author's TODO).
+  - MULI signed overflow is UB.
+  - NEGI of INT_MIN is UB.
+  - CVFI converting a NaN or out-of-range float to vmword_t is UB; clamp before cast.
+
+## Design-level limitations
+
+- [ ] A. No code-byte→instruction mapping kept. Same root as bug #3, but separately: syscalls and disassembly
+  can't report a byte PC that q3asm's debug info would refer to. Keep both code[] and an ip_of[] map.
+
+- [ ] B. code_mask/heap_mask forces power-of-two sizes. Real code size is padded with BREAK (stackvm.c:1237) —
+  a PC that walks off real code lands on a BREAK-pad and abort()s instead of erroring cleanly. Replace mask
+   checks with pc < code_len comparisons; drop the pad + abort.
+
+- [ ] C. vm_run_slice doesn't slice. Despite the name, it runs until return or error — no instruction-count
+  budget, no preemption. An infinite loop in a guest hangs the host. Add a max-steps parameter.
+
+- [ ] D. vm_enter has no bounds check (stackvm.c:120). Deep recursion or a guest that lies in ENTER lets psp
+  wrap below stack_bottom. Enforce psp >= stack_bottom on every ENTER/prepare_call.
+
+- [ ] E. prepare_call doesn't validate nr_args. MAX_VMMAIN_ARGS is defined but unused. If a host passes a bogus
+   nr_args, psp underflows silently.
+
+- [ ] F. No big-endian magic support. stackvm.txt documents 0x12721444 or 0x44147212; loader accepts only the
+  native-endian form. Either swap on load or reject with a clear message.
+
+- [ ] G. Float/integer endianness of DATA segment. heap.words[ofs>>2] = val assumes host word endianness
+  matches file word endianness — fine on x86 with q3asm output today, but a portability trap worth
+  commenting.
+
+- [ ] H. vm_env syscall table is indexed by -1 - syscall_num and never validates the table on vm_new — a
+  missing handler in vm_env_call falls through to out_error, which is fine, but there's no way for a host
+  to enumerate or default-handle unknown syscalls.
+
+- [ ] I. Debug logging on hot path. Every opcode prints a debug(...) line to stderr (stackvm.c:579) and every
+  push/pop trace-logs. Even a trivial program generates megabytes of output. Guard with a compile-time or
+  runtime verbosity flag.
+
+- [ ] J. vm_string deref's *len in its success log even if len==NULL — stackvm.c:1329 (info("…len=%d…",
+  (int)*len, …)). Crashes the host if a syscall passes NULL.
+
+- [ ] K. No stacktrace / no breakpoint callback. BREAK is hard-wired to abort(); vm_stacktrace is #if 0'd. For
+  a VM whose only use case is debugging guest code, this is the biggest missing feature.
+
+## Small stuff
+
+- [ ] unsigned ofs = -1 - syscall_num; in vm_env_register/vm_env_call — if a host ever passes INT_MIN, -1 -INT_MIN overflows. Clamp.
+- [ ] assert() on allocation failure in vm_env_new — asserts are compiled out with -DNDEBUG; return NULL instead.
+- [ ] opcode_to_name array has 60 entries but is indexed with b < ARRAY_SIZE(...) — ok, but there's no compile-time check that it tracks the opcode enum.
+- [ ] vm_call never runs the VM despite the TODO; documentation in the header should say "call this then loop vm_run_slice."
+- [ ] Hardcoded VM_STACK_SIZE = 1024 op-stack words with no way to raise it per-vm.
+
