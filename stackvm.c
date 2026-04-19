@@ -124,12 +124,7 @@ int vm_env_register(struct vm_env *env, int syscall_num, void (*sc)(struct vm *v
 }
 
 static inline vmword_t dread4(struct vm *vm, vmword_t ofs);
-
-static void vm_enter(struct vm *vm, unsigned local_size)
-{
-	vm->psp -= local_size;
-	// TODO: check bounds
-}
+static inline int check_stack_bounds(struct vm *vm);
 
 /* return 0 if returning normally, or 1 if from a syscall */
 static int vm_leave(struct vm *vm, unsigned local_size)
@@ -142,6 +137,8 @@ static int vm_leave(struct vm *vm, unsigned local_size)
 	assert(pc != 0xdeadbeef);
 	vm->pc = pc;
 	if ((int)pc == -1) {
+		/* re-entrant call's prepare_call saved caller psp at psp+4 */
+		vm->psp = dread4(vm, psp + 4);
 		info("%s:finished or returning to call\n", vm->vm_filename);
 		return 1;
 	}
@@ -162,9 +159,9 @@ static int vm_env_call(const struct vm_env *env, int syscall_num, struct vm *vm)
 	void (*sc)(struct vm *vm) = env->syscalls[ofs];
 	if (!sc) // TODO: catch this as an error
 		goto out_error;
+	/* syscalls don't use the VM frame convention: no ENTER/LEAVE.
+	 * caller (CALL dispatch) saves/restores vm->pc around this. */
 	unsigned old_stack = vm->op_stack;
-	unsigned local_size = 0;
-	vm_enter(vm, local_size);
 	sc(vm); // TODO: check for errors
 	if (vm->status)
 		goto out_error;
@@ -175,13 +172,6 @@ static int vm_env_call(const struct vm_env *env, int syscall_num, struct vm *vm)
 		opush(vm, 0);
 		// TODO: set an error flag instead of trying to fix it.
 	}
-#if 0
-	vm_leave(vm, local_size); /* I think it should be this */
-	// TODO: maybe we could do the equivalent of ENTER and use a local variable to old the real PC
-	// then restore that PC here.
-#else
-	vm_leave(vm, 0); // broken
-#endif
 	fprintf(stderr, "======== VM Call #%d : Success ========\n", ofs);
 	debug("pc=%d (%#x) psp=%d (%#x)\n", vm->pc, vm->pc, vm->psp, vm->psp);
 	return 0;
@@ -397,8 +387,10 @@ static inline int check_data_bounds(struct vm *vm, vmword_t ofs)
 
 static inline int check_stack_bounds(struct vm *vm)
 {
-	if (vm->psp < vm->stack_bottom)
+	if (vm->psp < vm->stack_bottom) {
+		vm_error_set(vm, VM_ERROR_STACK_OVERFLOW);
 		return -1;
+	}
 
 	return check_data_bounds(vm, vm->psp);
 }
@@ -495,7 +487,8 @@ static inline void dwrite2(struct vm *vm, vmword_t ofs, uint16_t val)
 
 static inline void dwrite1(struct vm *vm, vmword_t ofs, uint8_t val)
 {
-	check_data_bounds(vm, ofs);
+	if (check_data_bounds(vm, ofs))
+		return;
 	vm->heap.bytes[ofs] = val;
 }
 
@@ -662,8 +655,9 @@ int vm_run_slice(struct vm *vm)
 		case 0x01: /* IGNORE */
 			break;
 		case 0x02: /* BREAK */
-			abort(); // TODO: implement a debugging callback
-			break;
+			vm_error_set(vm, VM_ERROR_ABORT);
+			e = -1;
+			goto out;
 		case 0x03: /* ENTER - increase program stack by amount */
 			vm->psp -= param;
 			break;
@@ -894,8 +888,9 @@ int vm_run_slice(struct vm *vm)
 #if 0 // TODO: implement this
 			block_copy(vm, b, a, param);
 #endif
-			abort(); // TODO: implement this
-			break;
+			vm_error_set(vm, VM_ERROR_INVALID_OPCODE);
+			e = -1;
+			goto out;
 		case 0x23: /* SEX8 */
 			a = (int32_t)(int8_t)opop(vm);
 			opush(vm, a);
@@ -1071,18 +1066,28 @@ static inline void arg_write(struct vm *vm, int i, vmword_t val)
 	dwrite4(vm, vm->psp + 8 + (i * 4), val);
 }
 
-static void prepare_call(struct vm *vm, vmword_t entry, unsigned nr_args)
+static int prepare_call(struct vm *vm, vmword_t entry, unsigned nr_args)
 {
 	assert(vm != NULL);
+	if (nr_args > MAX_VMMAIN_ARGS) {
+		error("%s:vm_call nr_args=%u exceeds MAX_VMMAIN_ARGS=%u\n",
+		      vm->vm_filename, nr_args, MAX_VMMAIN_ARGS);
+		vm_error_set(vm, VM_ERROR_BAD_ENVIRONMENT);
+		return -1;
+	}
 	// TODO: turn this into a syscall if entry address is negative
 	vm->pc = pc_from_addr(vm, entry);
 	/* make space for args and return */
-	vmword_t old_psp = vm->psp - 8;
+	vmword_t old_psp = vm->psp;
 	vm->psp -= 8 + (4 * nr_args);
-	check_stack_bounds(vm);
-	/* store return address and old stack */
+	if (check_stack_bounds(vm))
+		return -1;
+	/* store return address and old stack. -1 signals "finished" to
+	 * vm_leave; old_psp is restored there so the host's psp survives
+	 * the re-entrant call. */
 	dwrite4(vm, vm->psp, -1);
 	dwrite4(vm, vm->psp + 4, old_psp);
+	return 0;
 }
 
 void vm_call(struct vm *vm, vmword_t entry, unsigned nr_args, ...)
@@ -1090,7 +1095,8 @@ void vm_call(struct vm *vm, vmword_t entry, unsigned nr_args, ...)
 	va_list ap;
 	unsigned i;
 
-	prepare_call(vm, entry, nr_args);
+	if (prepare_call(vm, entry, nr_args))
+		return;
 	va_start(ap, nr_args);
 	/* store args */
 	for (i = 0; i < nr_args; i++) {
@@ -1107,7 +1113,8 @@ void vm_call_array(struct vm *vm, vmword_t entry, unsigned nr_args, const vmword
 
 	assert(vm != NULL);
 	assert(args != NULL);
-	prepare_call(vm, entry, nr_args);
+	if (prepare_call(vm, entry, nr_args))
+		return;
 	/* store args */
 	for (i = 0; i < nr_args; i++)
 		arg_write(vm, i, args[i]);
@@ -1146,9 +1153,21 @@ static int load_data_segment(struct vm *vm, FILE *f, const char *filename, const
 	const unsigned data_length = header->data_length + header->lit_length;
 	const unsigned data_offset = header->data_offset;
 	heap_len = roundup_pow2(heap_len);
+
+	if (data_length > heap_len) {
+		error("%s:data segment (%u) larger than heap (%u)\n",
+		      filename, data_length, heap_len);
+		return -1;
+	}
+
 	vm->heap_len = heap_len;
 	vm->heap_mask = heap_len ? heap_len - 1 : 0;
 	vm->heap.bytes = malloc(vm->heap_len);
+
+	if (!vm->heap.bytes) {
+		error("out of memory allocating heap (%zu bytes)\n", vm->heap_len);
+		return -1;
+	}
 
 	if (fseek(f, data_offset, SEEK_SET))
 		goto failure_perror;
@@ -1156,12 +1175,8 @@ static int load_data_segment(struct vm *vm, FILE *f, const char *filename, const
 	if (fread(vm->heap.bytes, 1, data_length, f) != (size_t)data_length)
 		goto failure_perror; // TODO: check errno and print short read msg
 
-#if 0
-	fprintf(stdout, "data_length=%d\n", data_length);
-	hexdump(vm->heap.bytes, data_length, stdout);
-#endif
 	memset(vm->heap.bytes + data_length, 0x00,
-	       vm->heap_mask - data_length);
+	       vm->heap_len - data_length);
 	return 0;
 failure_perror:
 	perror(filename);
@@ -1333,8 +1348,11 @@ failure_freecodebuf:
 	free(codebuf);
 failure_freevm:
 	free(vm->heap.bytes);
+	vm->heap.bytes = NULL;
 	free(vm->code);
-	// TODO: free other stuff
+	vm->code = NULL;
+	free(vm->instr_to_byte);
+	vm->instr_to_byte = NULL;
 failure:
 	fclose(f);
 	error("%s:could not load file\n", filename);
@@ -1400,7 +1418,7 @@ char *vm_string(struct vm *vm, vmword_t addr, size_t *len)
 	}
 	if (len)
 		*len = e - s; /* length does not include the null termination */
-	info("%s:success:len=%d s=%s\n", vm->vm_filename, (int)*len, s);
+	info("%s:success:len=%d s=%s\n", vm->vm_filename, (int)(e - s), s);
 	return (char*)s;
 }
 

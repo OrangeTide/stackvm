@@ -2,17 +2,7 @@
 
 ## Priority (updated 2026-04-19, post-refactor)
 
-Tier 1 — host-safety breaks (guest can crash or corrupt the host process):
-  #1  dwrite1 OOB write after failed bounds check
-  #6  BLOCK_COPY / BREAK call abort()
-  #7  unchecked mallocs in vm_load
-  #J  vm_string derefs *len when len==NULL
-  #D  vm_enter / prepare_call no psp bounds check
-  #5  memset length wrong; wraps on malformed input → segfault
-
 Tier 2 — correctness / VM mis-executes:
-  #2  vm_env_call uses wrong local_size on leave (likely root of #11)
-  #11 ex3.qvm: saved PC overwritten across re-entrant syscalls
   #4  strict-aliasing UB in float push/pop (time bomb at -O2)
   #9  LSH/RSHI/RSHU with shift count ≥ 32 (UB, host-divergent)
   #10 signed-math UB (INT_MIN/-1, MULI overflow, NaN→int)
@@ -20,76 +10,23 @@ Tier 2 — correctness / VM mis-executes:
 Tier 3 — missing functionality:
   #C  vm_run_slice doesn't actually slice — infinite guest loops hang host
   #K  no BREAK callback / no guest stacktrace
-  #E  prepare_call doesn't validate nr_args against MAX_VMMAIN_ARGS
 
 Tier 4 — polish, portability, hygiene:
-  #8  fd leak on vm_load failure paths
   #F  big-endian magic not supported
   #G  DATA segment endianness assumption
   #H  no syscall-table validation / default handler
   #I  debug logging on hot path (megabytes of stderr per run)
   small-stuff items
 
-#1 and #6 are the best starting points: both are one-line fixes, both eliminate
-a class of guest-triggered host crash. #2+#11 are the natural pair after that —
-fixing the re-entrant syscall frame likely unblocks the ex3 test.
-
 ## Real bugs (likely to fire)
-
-- [ ] 1. dwrite1 still writes after an out-of-bounds check fails — stackvm.c:466
-  static inline void dwrite1(struct vm *vm, vmword_t ofs, uint8_t val)
-  {
-      check_data_bounds(vm, ofs);   // sets error flag, return ignored
-      vm->heap.bytes[ofs] = val;    // executes anyway → OOB write
-  }
-  Guest code can corrupt host memory with STORE1 to an out-of-range address. Return on failure like the
-  other dwrite*/dread*.
-
-- [ ] 2. vm_env_call uses the wrong local_size on leave — stackvm.c:175 (author already flagged // broken).
-  It also pre-overwrites vm->pc = 0xdeadbeef and then lets vm_leave read PC off the stack; only the
-  fallback vm->pc = old_pc after the call saves it. The whole enter/leave wrap around sc(vm) is dead work.
-  Simplest fix: drop the vm_enter/vm_leave pair for syscalls entirely — syscalls don't share the VM frame
-  convention.
-
-- [x] 3. Branch/CALL target address-space mismatch — FIXED (commit 0aa728a)
-  Original diagnosis was inverted: q3asm emits call/branch targets as *instruction ordinals*, and the old
-  expanded-op dispatcher happened to match that space by accident of indexing by instruction number. The
-  refactor moves dispatch to a raw byte stream (PC = byte offset) and adds an instr_to_byte[] table; CALL,
-  JUMP, conditional-branch immediates, and vm_call's entry arg translate through pc_from_addr().
 
 - [ ] 4. Strict-aliasing / type-punning in float push/pop — stackvm.c:421, 430
   *(vmword_t*)&val and *(vmsingle_t*)(vm->stack + ...) are UB under -O2 with strict aliasing. Use memcpy or
    a union — compilers have miscompiled exactly this pattern.
 
-- [ ] 5. memset length in load_data_segment — stackvm.c:1086
-  memset(vm->heap.bytes + data_length, 0x00, vm->heap_mask - data_length);
-  Should be vm->heap_len - data_length. heap_mask = heap_len - 1, so you're always zeroing one byte short
-  of the top of the heap. (Also: if data_length > heap_mask the subtraction wraps to a huge size_t →
-  segfault on malformed input.)
-
-- [ ] 6. BLOCK_COPY and BREAK call abort() — stackvm.c:591, 820
-  Guest code that hits either instantly kills the host process. At minimum set VM_ERROR_INVALID_OPCODE/a
-  new error bit instead.
-
-- [ ] 7. Unchecked mallocs in vm_load — codebuf, vm->code, and vm->heap.bytes are all used without NULL checks
-  (stackvm.c:1074, 1184, 1197). On OOM the process segfaults.
-
-- [ ] 8. File descriptor leaks on failure paths in vm_load — the
-  failure_perror/failure_freecodebuf/failure_freevm labels skip the fclose(f) that only failure: performs.
-
 - [ ] 9. Unshifted left/right shifts — stackvm.c:914, 919, 924
   LSH/RSHI/RSHU use b << a without masking a & 31; shift counts ≥ 32 are UB in C and guest-visible on
   different hosts.
-
-- [ ] 11. ex3.qvm: saved PC at psp+local_size gets overwritten across nested re-entrant calls
-  Reproduce: `make tests` — ex1 and ex2 pass, ex3 fails with VM_ERROR_OUT_OF_BOUNDS at pc=0x668a0
-  (=420000, the return value from trap_Callback(do_mul,600,700)). Dispatch trace ends on `LEAVE 24`
-  reading a bogus saved PC from address 131028; a prior `write 131028 : 420000` clobbered the slot.
-  Present on master before the byte-stream refactor too, so not a regression.
-  Suspects: (a) prepare_call / vm_env_call frame layout when the host re-enters the VM via
-  vm_call_array from inside a syscall handler — the inner call reuses psp that the outer guest frame
-  still owns; (b) the `// broken` vm_leave(vm, 0) in vm_env_call (see bug #2). Fix likely overlaps with
-  bug #2.
 
   10. Signed math UB
   - DIVI/MODI don't handle INT_MIN / -1 (author's TODO).
@@ -109,12 +46,6 @@ fixing the re-entrant syscall frame likely unblocks the ex3 test.
 - [ ] C. vm_run_slice doesn't slice. Despite the name, it runs until return or error — no instruction-count
   budget, no preemption. An infinite loop in a guest hangs the host. Add a max-steps parameter.
 
-- [ ] D. vm_enter has no bounds check (stackvm.c:120). Deep recursion or a guest that lies in ENTER lets psp
-  wrap below stack_bottom. Enforce psp >= stack_bottom on every ENTER/prepare_call.
-
-- [ ] E. prepare_call doesn't validate nr_args. MAX_VMMAIN_ARGS is defined but unused. If a host passes a bogus
-   nr_args, psp underflows silently.
-
 - [ ] F. No big-endian magic support. stackvm.txt documents 0x12721444 or 0x44147212; loader accepts only the
   native-endian form. Either swap on load or reject with a clear message.
 
@@ -129,9 +60,6 @@ fixing the re-entrant syscall frame likely unblocks the ex3 test.
 - [ ] I. Debug logging on hot path. Every opcode prints a debug(...) line to stderr (stackvm.c:579) and every
   push/pop trace-logs. Even a trivial program generates megabytes of output. Guard with a compile-time or
   runtime verbosity flag.
-
-- [ ] J. vm_string deref's *len in its success log even if len==NULL — stackvm.c:1329 (info("…len=%d…",
-  (int)*len, …)). Crashes the host if a syscall passes NULL.
 
 - [ ] K. No stacktrace / no breakpoint callback. BREAK is hard-wired to abort(); vm_stacktrace is #if 0'd. For
   a VM whose only use case is debugging guest code, this is the biggest missing feature.
