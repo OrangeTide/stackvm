@@ -52,6 +52,7 @@ struct vm;
 struct vm_env {
 	unsigned nr_syscalls;
 	void (**syscalls)(struct vm *vm);
+	int (*break_handler)(struct vm *vm); /* nonzero return = resume, 0 = abort */
 };
 
 struct vm {
@@ -122,6 +123,11 @@ int vm_env_register(struct vm_env *env, int syscall_num, void (*sc)(struct vm *v
 		return -1;
 	env->syscalls[ofs] = sc;
 	return 0;
+}
+
+void vm_env_set_break_handler(struct vm_env *env, int (*handler)(struct vm *vm))
+{
+	env->break_handler = handler;
 }
 
 static inline vmword_t dread4(struct vm *vm, vmword_t ofs);
@@ -371,11 +377,6 @@ static inline int _check_code_bounds(const char *func, unsigned line, struct vm 
 	return 0;
 }
 
-#define check_code_bounds(vm, ofs) do { \
-	if ((ofs) >= (vm)->code_len) { \
-		vm_error_set(vm, VM_ERROR_OUT_OF_BOUNDS); \
-	} } while (0)
-
 static inline int check_data_bounds(struct vm *vm, vmword_t ofs)
 {
 	if (ofs & ~vm->heap_mask) {
@@ -601,12 +602,31 @@ static int fetch_op(struct vm *vm, uint8_t *out_op, vmword_t *out_param)
 	return 1;
 }
 
-#if 0
-static void vm_stacktrace(const struct vm *vm)
+/* walk saved call frames and print a stacktrace to stderr.
+ * frame layout: at psp is saved PC, at psp+4 is caller's psp. A saved PC of
+ * -1 marks the bootstrap frame (no caller). */
+void vm_stacktrace(const struct vm *vm)
 {
-	abort(); // TODO: implement this
+	fprintf(stderr, "STACKTRACE pc=0x%x psp=0x%x\n", vm->pc, vm->psp);
+	vmword_t psp = vm->psp;
+	unsigned depth = 0;
+	while (depth < 64) {
+		if (psp >= vm->heap_len || (psp + 8) > vm->heap_len) {
+			fprintf(stderr, "  [frame %u: psp=0x%x out of range]\n", depth, psp);
+			break;
+		}
+		vmword_t saved_pc = vm->heap.words[(psp & vm->heap_mask) >> 2];
+		vmword_t saved_sp = vm->heap.words[((psp + 4) & vm->heap_mask) >> 2];
+		fprintf(stderr, "  [frame %u] psp=0x%x saved_pc=0x%x saved_sp=0x%x\n",
+			depth, psp, saved_pc, saved_sp);
+		if (saved_pc == (vmword_t)-1)
+			break;
+		if (saved_sp <= psp)
+			break;
+		psp = saved_sp;
+		depth++;
+	}
 }
-#endif
 
 /* run up to max_steps instructions (0 = unlimited).
  * return 1 if finished (re-entrant), 0 if not finished (budget exhausted or
@@ -629,10 +649,6 @@ int vm_run_slice(struct vm *vm, unsigned max_steps)
 		if (max_steps && steps++ >= max_steps) {
 			e = 0;
 			goto out;
-		}
-		if (vm->pc >= vm->code_len) {
-			vm_error_set(vm, VM_ERROR_OUT_OF_BOUNDS);
-			break;
 		}
 
 		vmword_t op_pc = vm->pc;
@@ -670,6 +686,10 @@ int vm_run_slice(struct vm *vm, unsigned max_steps)
 		case 0x01: /* IGNORE */
 			break;
 		case 0x02: /* BREAK */
+			if (vm->env && vm->env->break_handler &&
+			    vm->env->break_handler(vm))
+				break; /* handler requested resume */
+			vm_stacktrace(vm);
 			vm_error_set(vm, VM_ERROR_ABORT);
 			e = -1;
 			goto out;
@@ -1077,6 +1097,7 @@ out:
 	trace("%s:run slice e=%d status=%#x\n", vm->vm_filename, e, vm->status);
 	/* dump some of the stack on error */
 	if (e < 0) {
+		vm_stacktrace(vm);
 		error("%s:pstack trace:\n", vm->vm_filename);
 		debug("pc=%d (%#x) psp=%d (%#x) bottom=%#x op_stk=%d\n",
 		      vm->pc, vm->pc, vm->psp, vm->psp, vm->stack_bottom, vm->op_stack);
@@ -1363,7 +1384,6 @@ int vm_load(struct vm *vm, const char *filename)
 	vm->nr_instructions = nr_instructions;
 	debug("%zu instructions in %zd code bytes\n",
 	      nr_instructions, codebuf_len);
-	debug("Loaded %zd code bytes\n", codebuf_len);
 
 	fclose(f);
 

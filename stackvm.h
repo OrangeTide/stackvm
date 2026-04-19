@@ -25,6 +25,8 @@ struct vm;
 
 struct vm_env *vm_env_new(unsigned nr_syscalls);
 int vm_env_register(struct vm_env *env, int syscall_num, void (*sc)(struct vm *vm));
+void vm_env_set_break_handler(struct vm_env *env, int (*handler)(struct vm *vm));
+void vm_stacktrace(const struct vm *vm);
 void vm_disassemble(const struct vm *vm);
 int vm_run_slice(struct vm *vm, unsigned max_steps);
 void vm_call(struct vm *vm, vmword_t entry, unsigned nr_args, ...);

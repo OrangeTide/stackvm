@@ -2,9 +2,6 @@
 
 ## Priority (updated 2026-04-19, post-refactor)
 
-Tier 3 — missing functionality:
-  #K  no BREAK callback / no guest stacktrace
-
 Tier 4 — polish, portability, hygiene:
   #F  big-endian magic not supported
   #G  DATA segment endianness assumption
@@ -35,9 +32,6 @@ Tier 4 — polish, portability, hygiene:
 - [ ] I. Debug logging on hot path. Every opcode prints a debug(...) line to stderr (stackvm.c:579) and every
   push/pop trace-logs. Even a trivial program generates megabytes of output. Guard with a compile-time or
   runtime verbosity flag.
-
-- [ ] K. No stacktrace / no breakpoint callback. BREAK is hard-wired to abort(); vm_stacktrace is #if 0'd. For
-  a VM whose only use case is debugging guest code, this is the biggest missing feature.
 
 ## Small stuff
 
