@@ -6,6 +6,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -439,17 +440,24 @@ static vmword_t opop(struct vm *vm)
 static void opushf(struct vm *vm, vmsingle_t val)
 {
 	static_assert(sizeof(val) == sizeof(vmword_t), "vmword_t and vmsingle_t must be of equal size");
-	if (vm->op_stack < ARRAY_SIZE(vm->stack))
-		memcpy(&vm->stack[vm->op_stack++], &val, sizeof(val));
-	else
+	if (vm->op_stack < ARRAY_SIZE(vm->stack)) {
+		vmword_t bits;
+		memcpy(&bits, &val, sizeof(bits));
+		vm->stack[vm->op_stack++] = bits;
+	} else {
 		vm_error_set(vm, VM_ERROR_STACK_OVERFLOW);
+	}
 }
 
 /* pop a value from the op stack */
 static vmsingle_t opopf(struct vm *vm)
 {
-	if (vm->op_stack)
-		return *(vmsingle_t*)(vm->stack + --vm->op_stack);
+	if (vm->op_stack) {
+		vmword_t bits = vm->stack[--vm->op_stack];
+		vmsingle_t val;
+		memcpy(&val, &bits, sizeof(val));
+		return val;
+	}
 
 	vm_error_set(vm, VM_ERROR_STACK_UNDERFLOW);
 	return NAN;
@@ -901,7 +909,9 @@ int vm_run_slice(struct vm *vm)
 			break;
 		case 0x25: /* NEGI */
 			a = opop(vm);
-			opush(vm, -a);
+			/* -INT_MIN overflows signed negation; use unsigned
+			 * two's-complement which is well-defined. */
+			opush(vm, (vmword_t)0 - a);
 			break;
 		case 0x26: /* ADD */
 			a = opop(vm);
@@ -917,10 +927,12 @@ int vm_run_slice(struct vm *vm)
 			a = opop(vm);
 			b = opop(vm);
 
-			if (a) // TODO: check for INT_MIN / -1
-				opush(vm, (int)b / (int)a);
-			else
+			if (!a)
 				vm_error_set(vm, VM_ERROR_MATH_ERROR);
+			else if ((int)a == -1 && (int)b == INT_MIN)
+				opush(vm, (vmword_t)INT_MIN); /* wrap per two's-complement */
+			else
+				opush(vm, (int)b / (int)a);
 
 			break;
 		case 0x29: /* DIVU */
@@ -937,10 +949,12 @@ int vm_run_slice(struct vm *vm)
 			a = opop(vm);
 			b = opop(vm);
 
-			if (a) // TODO: check for INT_MIN / -1
-				opush(vm, (int)b % (int)a);
-			else
+			if (!a)
 				vm_error_set(vm, VM_ERROR_MATH_ERROR);
+			else if ((int)a == -1 && (int)b == INT_MIN)
+				opush(vm, 0);
+			else
+				opush(vm, (int)b % (int)a);
 
 			break;
 		case 0x2b: /* MODU */
@@ -956,8 +970,8 @@ int vm_run_slice(struct vm *vm)
 		case 0x2c: /* MULI */
 			a = opop(vm);
 			b = opop(vm);
-			// TODO: check for INT_MIN * -1 errors
-			opush(vm, b * a);
+			/* unsigned multiply wraps cleanly; reinterpret. */
+			opush(vm, a * b);
 			break;
 		case 0x2d: /* MULU */
 			a = opop(vm);
@@ -986,17 +1000,17 @@ int vm_run_slice(struct vm *vm)
 		case 0x32: /* LSH */
 			a = opop(vm);
 			b = opop(vm);
-			opush(vm, b << a);
+			opush(vm, b << (a & 31));
 			break;
 		case 0x33: /* RSHI */
 			a = opop(vm);
 			b = opop(vm);
-			opush(vm, (int)b >> a);
+			opush(vm, (int)b >> (a & 31));
 			break;
 		case 0x34: /* RSHU */
 			a = opop(vm);
 			b = opop(vm);
-			opush(vm, (unsigned)b >> a);
+			opush(vm, (unsigned)b >> (a & 31));
 			break;
 		case 0x35: /* NEGF */
 			af = opopf(vm);
@@ -1027,8 +1041,19 @@ int vm_run_slice(struct vm *vm)
 			opushf(vm, af);
 			break;
 		case 0x3b: /* CVFI */
-			a = (vmword_t)opopf(vm);
-			opush(vm, a);
+			{
+				vmsingle_t f = opopf(vm);
+				int32_t iv;
+				if (isnan(f))
+					iv = 0;
+				else if (f >= (vmsingle_t)INT32_MAX)
+					iv = INT32_MAX;
+				else if (f <= (vmsingle_t)INT32_MIN)
+					iv = INT32_MIN;
+				else
+					iv = (int32_t)f;
+				opush(vm, (vmword_t)iv);
+			}
 			break;
 		default:
 			vm_error_set(vm, VM_ERROR_INVALID_OPCODE);

@@ -2,11 +2,6 @@
 
 ## Priority (updated 2026-04-19, post-refactor)
 
-Tier 2 — correctness / VM mis-executes:
-  #4  strict-aliasing UB in float push/pop (time bomb at -O2)
-  #9  LSH/RSHI/RSHU with shift count ≥ 32 (UB, host-divergent)
-  #10 signed-math UB (INT_MIN/-1, MULI overflow, NaN→int)
-
 Tier 3 — missing functionality:
   #C  vm_run_slice doesn't actually slice — infinite guest loops hang host
   #K  no BREAK callback / no guest stacktrace
@@ -17,22 +12,6 @@ Tier 4 — polish, portability, hygiene:
   #H  no syscall-table validation / default handler
   #I  debug logging on hot path (megabytes of stderr per run)
   small-stuff items
-
-## Real bugs (likely to fire)
-
-- [ ] 4. Strict-aliasing / type-punning in float push/pop — stackvm.c:421, 430
-  *(vmword_t*)&val and *(vmsingle_t*)(vm->stack + ...) are UB under -O2 with strict aliasing. Use memcpy or
-   a union — compilers have miscompiled exactly this pattern.
-
-- [ ] 9. Unshifted left/right shifts — stackvm.c:914, 919, 924
-  LSH/RSHI/RSHU use b << a without masking a & 31; shift counts ≥ 32 are UB in C and guest-visible on
-  different hosts.
-
-  10. Signed math UB
-  - DIVI/MODI don't handle INT_MIN / -1 (author's TODO).
-  - MULI signed overflow is UB.
-  - NEGI of INT_MIN is UB.
-  - CVFI converting a NaN or out-of-range float to vmword_t is UB; clamp before cast.
 
 ## Design-level limitations
 
@@ -71,4 +50,3 @@ Tier 4 — polish, portability, hygiene:
 - [ ] opcode_to_name array has 60 entries but is indexed with b < ARRAY_SIZE(...) — ok, but there's no compile-time check that it tracks the opcode enum.
 - [ ] vm_call never runs the VM despite the TODO; documentation in the header should say "call this then loop vm_run_slice."
 - [ ] Hardcoded VM_STACK_SIZE = 1024 op-stack words with no way to raise it per-vm.
-
