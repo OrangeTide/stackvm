@@ -3,7 +3,6 @@
 ## Priority (updated 2026-04-19, post-refactor)
 
 Tier 3 — missing functionality:
-  #C  vm_run_slice doesn't actually slice — infinite guest loops hang host
   #K  no BREAK callback / no guest stacktrace
 
 Tier 4 — polish, portability, hygiene:
@@ -21,9 +20,6 @@ Tier 4 — polish, portability, hygiene:
 - [ ] B. code_mask/heap_mask forces power-of-two sizes. Real code size is padded with BREAK (stackvm.c:1237) —
   a PC that walks off real code lands on a BREAK-pad and abort()s instead of erroring cleanly. Replace mask
    checks with pc < code_len comparisons; drop the pad + abort.
-
-- [ ] C. vm_run_slice doesn't slice. Despite the name, it runs until return or error — no instruction-count
-  budget, no preemption. An infinite loop in a guest hangs the host. Add a max-steps parameter.
 
 - [ ] F. No big-endian magic support. stackvm.txt documents 0x12721444 or 0x44147212; loader accepts only the
   native-endian form. Either swap on load or reject with a clear message.

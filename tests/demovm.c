@@ -93,7 +93,9 @@ static void sys_trap_callback(struct vm *vm)
 	vm_call_array(vm, func, n_args, args);
 	// TODO: run the vm, and get a return value
 	int e;
-	e = vm_run_slice(vm);
+	do {
+		e = vm_run_slice(vm, 1000000);
+	} while (e == 0);
 	info("Callback:e=%d status=%#x\n", e, vm_status(vm));
 	if (e == 1) {
 		// assume the function we called in vm_run_slice left data on stack
@@ -125,7 +127,7 @@ int main(int argc, char **argv)
 	vm_call(vm, 0, 2, 500, 800); /* result should be 1800 (500+500+800) */
 	int e;
 	do {
-		e = vm_run_slice(vm);
+		e = vm_run_slice(vm, 1000000);
 	} while (e == 0);
 
 	vmword_t result = 0xdeadbeef;

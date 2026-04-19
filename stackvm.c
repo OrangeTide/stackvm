@@ -608,14 +608,17 @@ static void vm_stacktrace(const struct vm *vm)
 }
 #endif
 
-/* return 1 if finished (re-entrant), 0 if not finished, and -1 on error. */
-int vm_run_slice(struct vm *vm)
+/* run up to max_steps instructions (0 = unlimited).
+ * return 1 if finished (re-entrant), 0 if not finished (budget exhausted or
+ * still running), and -1 on error. */
+int vm_run_slice(struct vm *vm, unsigned max_steps)
 {
 	vmword_t a; /* scratch area */
 	vmword_t b; /* scratch area */
 	vmsingle_t af; /* scratch area */
 	vmsingle_t bf; /* scratch area */
 	int e;
+	unsigned steps = 0;
 
 	debug("code_len=0x%08zx\n", vm->code_len);
 	debug("heap_mask=0x%08zx heap_len=0x%08zx\n",
@@ -623,6 +626,10 @@ int vm_run_slice(struct vm *vm)
 	assert(vm->heap_mask == make_mask(vm->heap_len));
 
 	while (!vm->status && !_check_code_bounds(__func__, __LINE__, vm, vm->pc)) {
+		if (max_steps && steps++ >= max_steps) {
+			e = 0;
+			goto out;
+		}
 		if (vm->pc >= vm->code_len) {
 			vm_error_set(vm, VM_ERROR_OUT_OF_BOUNDS);
 			break;
