@@ -78,7 +78,6 @@ struct vm {
 		uint8_t *bytes;
 	} heap;
 	size_t heap_len;
-	size_t heap_mask;
 	int status; /* stop loop when non-zero */
 	vmword_t pc; /* program counter */
 	vmword_t psp; /* program stack pointer */
@@ -382,17 +381,6 @@ static void disassemble(FILE *out, const uint8_t *code, size_t code_len, vmword_
 	fprintf(out, "---8<--- end of disassembly ---8<---\n");
 }
 
-/* round up len to next power of two minus one */
-static size_t make_mask(size_t len)
-{
-	size_t ret = 0;
-
-	while (ret + 1 < len)
-		ret = (ret << 1) | 1;
-
-	return ret;
-}
-
 static inline int _check_code_bounds(const char *func, unsigned line, struct vm *vm, vmword_t ofs)
 {
 	if (ofs >= vm->code_len) {
@@ -406,7 +394,7 @@ static inline int _check_code_bounds(const char *func, unsigned line, struct vm 
 
 static inline int check_data_bounds(struct vm *vm, vmword_t ofs)
 {
-	if (ofs & ~vm->heap_mask) {
+	if (ofs >= vm->heap_len) {
 		vm_error_set(vm, VM_ERROR_OUT_OF_BOUNDS);
 		return -1;
 	}
@@ -642,8 +630,8 @@ void vm_stacktrace(const struct vm *vm)
 			fprintf(stderr, "  [frame %u: psp=0x%x out of range]\n", depth, psp);
 			break;
 		}
-		vmword_t saved_pc = vm->heap.words[(psp & vm->heap_mask) >> 2];
-		vmword_t saved_sp = vm->heap.words[((psp + 4) & vm->heap_mask) >> 2];
+		vmword_t saved_pc = vm->heap.words[psp >> 2];
+		vmword_t saved_sp = vm->heap.words[(psp + 4) >> 2];
 		fprintf(stderr, "  [frame %u] psp=0x%x saved_pc=0x%x saved_sp=0x%x\n",
 			depth, psp, saved_pc, saved_sp);
 		if (saved_pc == (vmword_t)-1)
@@ -667,10 +655,8 @@ int vm_run_slice(struct vm *vm, unsigned max_steps)
 	int e;
 	unsigned steps = 0;
 
-	debug("code_len=0x%08zx\n", vm->code_len);
-	debug("heap_mask=0x%08zx heap_len=0x%08zx\n",
-	      vm->heap_mask, vm->heap_len);
-	assert(vm->heap_mask == make_mask(vm->heap_len));
+	debug("code_len=0x%08zx heap_len=0x%08zx\n",
+	      vm->code_len, vm->heap_len);
 
 	while (!vm->status && !_check_code_bounds(__func__, __LINE__, vm, vm->pc)) {
 		if (max_steps && steps++ >= max_steps) {
@@ -1201,18 +1187,6 @@ void vm_call_array(struct vm *vm, vmword_t entry, unsigned nr_args, const vmword
 	// TODO: optionally vm_run() until complete and return result
 }
 
-static inline unsigned roundup_pow2(unsigned n)
-{
-	n--;
-	n |= n >> 1;
-	n |= n >> 2;
-	n |= n >> 4;
-	n |= n >> 8;
-	n |= n >> 16;
-	n++;
-	return n;
-}
-
 struct vm_header {
 #define VM_MAGIC 0x12721444
 #define VM_MAGIC_VER2   0x12721445
@@ -1232,7 +1206,8 @@ static int load_data_segment(struct vm *vm, FILE *f, const char *filename, const
 	uint32_t heap_len = header->data_length + header->lit_length + header->bss_length;
 	const unsigned data_length = header->data_length + header->lit_length;
 	const unsigned data_offset = header->data_offset;
-	heap_len = roundup_pow2(heap_len);
+	/* round up to a multiple of 4 so word-sized tail accesses stay in range */
+	heap_len = (heap_len + 3u) & ~3u;
 
 	if (data_length > heap_len) {
 		error("%s:data segment (%u) larger than heap (%u)\n",
@@ -1241,7 +1216,6 @@ static int load_data_segment(struct vm *vm, FILE *f, const char *filename, const
 	}
 
 	vm->heap_len = heap_len;
-	vm->heap_mask = heap_len ? heap_len - 1 : 0;
 	vm->heap.bytes = malloc(vm->heap_len);
 
 	if (!vm->heap.bytes) {
@@ -1276,7 +1250,7 @@ void vm_free(struct vm *vm)
 	vm->vm_filename = NULL;
 	free(vm->heap.bytes);
 	vm->heap.bytes = NULL;
-	vm->heap_len = vm->heap_mask = 0;
+	vm->heap_len = 0;
 	free(vm->code);
 	vm->code = NULL;
 	vm->code_len = 0;
@@ -1425,7 +1399,7 @@ int vm_load(struct vm *vm, const char *filename)
 
 	/* initialize fields */
 	vm->pc = 0;
-	vm->psp = (vm->heap_mask + 1) - 4; /* points to the last word */
+	vm->psp = vm->heap_len - 4; /* points to the last word */
 	vm->stack_bottom = vm->psp - PROGRAM_STACK_SIZE;
 	vm->status = 0;
 
