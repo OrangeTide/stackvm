@@ -37,6 +37,9 @@ void vm_call(struct vm *vm, vmword_t entry, unsigned nr_args, ...);
 void vm_call_array(struct vm *vm, vmword_t entry, unsigned nr_args, const vmword_t args[]);
 void vm_free(struct vm *vm);
 struct vm *vm_new(const struct vm_env *env);
+/* resize the op stack; must be called before any guest pushes (op stack empty).
+ * returns 0 on success, -1 on bad args / allocation failure / non-empty stack. */
+int vm_set_stack_size(struct vm *vm, unsigned words);
 int vm_load(struct vm *vm, const char *filename);
 int vm_status(const struct vm *vm);
 const char *vm_filename(const struct vm *vm);

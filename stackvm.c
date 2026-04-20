@@ -44,7 +44,7 @@ int stackvm_verbose = 0;
 
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof *(a))
 
-#define VM_STACK_SIZE 1024
+#define VM_DEFAULT_STACK_SIZE 1024
 #define PROGRAM_STACK_SIZE 0x10000
 #define MAX_VMMAIN_ARGS 13
 
@@ -82,7 +82,8 @@ struct vm {
 	vmword_t pc; /* program counter */
 	vmword_t psp; /* program stack pointer */
 	vmword_t stack_bottom; /* end of the program stack */ // TODO: rename this
-	vmword_t stack[VM_STACK_SIZE] __attribute__ ((aligned (__BIGGEST_ALIGNMENT__))); /* op stack */
+	vmword_t *stack; /* op stack */
+	unsigned stack_size; /* op stack capacity in words */
 	unsigned op_stack;
 	/* bootstrap and input parameters */
 	char *vm_filename;
@@ -417,7 +418,7 @@ static void opush(struct vm *vm, vmword_t val)
 {
 	trace("%s:PUSH %d\n", vm->vm_filename, val);
 
-	if (vm->op_stack < ARRAY_SIZE(vm->stack))
+	if (vm->op_stack < vm->stack_size)
 		vm->stack[vm->op_stack++] = val;
 	else
 		vm_error_set(vm, VM_ERROR_STACK_OVERFLOW);
@@ -456,7 +457,7 @@ static vmword_t opop(struct vm *vm)
 static void opushf(struct vm *vm, vmsingle_t val)
 {
 	static_assert(sizeof(val) == sizeof(vmword_t), "vmword_t and vmsingle_t must be of equal size");
-	if (vm->op_stack < ARRAY_SIZE(vm->stack)) {
+	if (vm->op_stack < vm->stack_size) {
 		vmword_t bits;
 		memcpy(&bits, &val, sizeof(bits));
 		vm->stack[vm->op_stack++] = bits;
@@ -1257,14 +1258,42 @@ void vm_free(struct vm *vm)
 	free(vm->instr_to_byte);
 	vm->instr_to_byte = NULL;
 	vm->nr_instructions = 0;
+	free(vm->stack);
+	vm->stack = NULL;
+	vm->stack_size = 0;
 	free(vm);
 }
 
 struct vm *vm_new(const struct vm_env *env)
 {
 	struct vm *vm = calloc(1, sizeof(*vm));
+	if (!vm)
+		return NULL;
 	vm->env = env;
+	vm->stack = calloc(VM_DEFAULT_STACK_SIZE, sizeof(*vm->stack));
+	if (!vm->stack) {
+		free(vm);
+		return NULL;
+	}
+	vm->stack_size = VM_DEFAULT_STACK_SIZE;
 	return vm;
+}
+
+int vm_set_stack_size(struct vm *vm, unsigned words)
+{
+	if (!vm || !words)
+		return -1;
+	/* safe before guest runs: require the stack to be empty so we don't
+	 * discard live values. */
+	if (vm->op_stack)
+		return -1;
+	vmword_t *ns = calloc(words, sizeof(*ns));
+	if (!ns)
+		return -1;
+	free(vm->stack);
+	vm->stack = ns;
+	vm->stack_size = words;
+	return 0;
 }
 
 /* return 1 on success, 0 on failure */
@@ -1278,10 +1307,14 @@ int vm_load(struct vm *vm, const char *filename)
 	if (!vm)
 		return 0;
 
-	/* erase everything except the environment. */
+	/* erase everything except the environment and the pre-allocated op stack. */
 	const struct vm_env *env = vm->env;
+	vmword_t *saved_stack = vm->stack;
+	unsigned saved_stack_size = vm->stack_size;
 	memset(vm, 0, sizeof(*vm));
 	vm->env = env;
+	vm->stack = saved_stack;
+	vm->stack_size = saved_stack_size;
 
 	f = fopen(filename, "rb");
 	if (!f) {
