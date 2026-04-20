@@ -1,22 +1,22 @@
 # Bug & design-limitation review of stackvm.c
 
-All previously-tracked correctness, missing-functionality, and Tier-4
-polish bugs have been addressed. Remaining items below are design
-limitations whose resolutions would be substantial refactors, not bug
-fixes.
+All tracked correctness, missing-functionality, polish, and design-level
+items have been addressed. This file is kept for the historical record;
+see git log for the specific commits that fixed each.
 
-## Design-level limitations
+## Resolved
 
-- [ ] A. No code-byte→instruction mapping kept. Same root as bug #3, but separately: syscalls and disassembly
-  can't report a byte PC that q3asm's debug info would refer to. Keep both code[] and an ip_of[] map.
-  (Partial: PC is now byte-addressed post-refactor, so syscalls and traces DO report native byte PCs. A
-  dedicated ip_of[] is still absent but may no longer be necessary.)
+- [x] A. No code-byte→instruction mapping kept. Resolved by the raw
+  byte-stream refactor (fe4c07c): PC is now a byte offset, so syscalls,
+  traces, and disassembly report native byte PCs that match q3asm's
+  debug info directly. A dedicated ip_of[] is not needed.
 
-- [ ] B. code_mask/heap_mask forces power-of-two sizes. Real code size is padded with BREAK (stackvm.c:1237) —
-  a PC that walks off real code lands on a BREAK-pad and abort()s instead of erroring cleanly. Replace mask
-   checks with pc < code_len comparisons; drop the pad + abort.
-  (Partial: code[] no longer uses a mask post-refactor; heap still does.)
+- [x] B. code_mask / heap_mask forced power-of-two sizes. code[] stopped
+  using a mask in the byte-stream refactor. Heap mask dropped in a
+  follow-up: bounds-check against heap_len directly and round to a
+  4-byte multiple instead of a pow2 (the only property the mask was
+  enforcing for word-sized tail accesses).
 
-## Small stuff (remaining)
-
-- [ ] Hardcoded VM_STACK_SIZE = 1024 op-stack words with no way to raise it per-vm.
+- [x] Hardcoded VM_STACK_SIZE = 1024 op-stack words. Stack is now
+  malloc'd per vm with default 1024; hosts that need more call
+  vm_set_stack_size(vm, words) before the guest runs.
